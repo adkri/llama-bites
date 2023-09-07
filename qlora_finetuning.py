@@ -142,6 +142,8 @@ def main():
     model = init_model()
     tokenizer = LlamaTokenizer.from_pretrained(CONFIG["model_name"])
     tokenizer.add_special_tokens({"pad_token": "<PAD>"})
+    model.resize_token_embeddings(len(tokenizer))
+
     optimizer = optim.AdamW(
         model.parameters(),
         lr=CONFIG["learning_rate"],
