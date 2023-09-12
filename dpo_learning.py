@@ -1,13 +1,12 @@
 import torch
 import pandas as pd
-import json
 import gc
-import time
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig
 from torch.optim.lr_scheduler import StepLR
+from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, LlamaForCausalLM
 
@@ -197,30 +196,47 @@ def _get_batch_logps(
 
 
 if __name__ == "__main__":
-    feedback_data = get_dataset()
-    dataloader = torch.utils.data.DataLoader(
-        feedback_data.to_dict(orient="records"), batch_size=2
-    )
-
     policy_model, tokenizer = get_model_and_tokenizer()
-    optimizer, lr_scheduler = configure_optimizer(policy_model)
 
     reference_model, tokenizer = get_model_and_tokenizer()
-    policy_model.train()
-    reference_model.eval()
+    reference_model.eval()  # freeze the reference model
+
+    optimizer, lr_scheduler = configure_optimizer(policy_model)
+
+    gradient_accumulation_steps = 1
 
     # start training
-    for step, batch in enumerate(dataloader):
-        loss, choosen_reward, rejected_reward = forward_and_compute_loss(
-            tokenizer, policy_model, reference_model, batch
+    for epoch in range(5):
+        dataloader = torch.utils.data.DataLoader(
+            get_dataset().to_dict(orient="records"), batch_size=4
         )
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-        print(loss)
-        gc.collect()
-        gc.collect()
-        torch.cuda.empty_cache()
+        policy_model.train()
+
+        total_loss = 0
+        total_len = len(dataloader) // gradient_accumulation_steps
+
+        pbar = tqdm(colour="green", desc=f"Training epoch: {epoch}", total=total_len)
+        for step, batch in enumerate(dataloader):
+            loss, choosen_reward, rejected_reward = forward_and_compute_loss(
+                tokenizer, policy_model, reference_model, batch
+            )
+            loss = loss / gradient_accumulation_steps
+            total_loss += loss.detach().float()
+
+            loss.backward()
+            if (step + 1) % gradient_accumulation_steps == 0 or step == len(
+                dataloader
+            ) - 1:
+                optimizer.step()
+                optimizer.zero_grad()
+                pbar.update(step // gradient_accumulation_steps)
+            pbar.set_description(f"Training epoch: {epoch} loss: {loss}")
+            print(loss)
+            gc.collect()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        lr_scheduler.step()
 
     # save the model
     policy_model.save_pretrained("dpo_model")
