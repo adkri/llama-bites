@@ -140,6 +140,7 @@ def compute_dpo_loss(
     policy_rejected,
     reference_choosen,
     reference_rejected,
+    beta=0.1,
     without_reference=False,
 ):
     policy_ratio = policy_chosen - policy_rejected
@@ -150,9 +151,9 @@ def compute_dpo_loss(
 
     logits = policy_ratio - reference_ratio
 
-    losses = -F.logsigmoid(logits)
-    choosen_reward = policy_chosen
-    rejected_reward = policy_rejected
+    losses = -F.logsigmoid(beta * logits)
+    choosen_reward = beta * (policy_chosen - reference_choosen).detach()
+    rejected_reward = beta * (policy_rejected - reference_rejected).detach()
 
     return losses, choosen_reward, rejected_reward
 
@@ -213,9 +214,18 @@ if __name__ == "__main__":
 
         pbar = tqdm(colour="green", desc=f"Training epoch: {epoch}", total=total_len)
         for step, batch in enumerate(dataloader):
-            loss, choosen_reward, rejected_reward = forward_and_compute_loss(
+            loss, chosen_rewards, rejected_rewards = forward_and_compute_loss(
                 tokenizer, policy_model, reference_model, batch
             )
+            reward_accuracies = (
+                (chosen_rewards > rejected_rewards).float().cpu().numpy().tolist()
+            )
+            reward_margins = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+            # print("Chosen Rewards:", chosen_rewards.cpu().numpy().tolist())
+            # print("Rejected Rewards:", rejected_rewards.cpu().numpy().tolist())
+            # print(f"Reward Accuracies: {reward_accuracies}")
+            # print(f"Reward Margins: {reward_margins}")
+
             loss = loss / gradient_accumulation_steps
             total_loss += loss.detach().float()
 
