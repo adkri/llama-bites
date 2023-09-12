@@ -89,49 +89,30 @@ def forward_and_compute_loss(tokenizer, policy_model, reference_model, batch):
     combined = [
         tokenize_item(tokenizer, item) for item in batch["Chosen"] + batch["Rejected"]
     ]
-
-    concatenated = {k: torch.stack([d[k] for d in combined]) for k in combined[0]}
-    # concatenated is {input_ids: [....], attention_mask: [...], labels: [....]}
-    for key in concatenated.keys():
-        concatenated[key] = concatenated[key].to("cuda:0")
+    concatenated = {
+        k: torch.stack([d[k] for d in combined]).to("cuda:0") for k in combined[0]
+    }
+    # concatenated is {"input_ids": [...], "attention_mask": [...], "labels": [...]}
 
     # forward pass through both models
     policy_logits = policy_model(**concatenated).logits.float()
     with torch.no_grad():
         reference_logits = reference_model(**concatenated).logits.float()
 
-    policy_logps = _get_batch_logps(
+    policy_chosen_logps, policy_rejected_logps = _get_batch_logps(
         tokenizer, policy_logits, concatenated["labels"], average_log_prob=True
-    )
-    policy_chosen_logps, policy_rejected_logps = (
-        policy_logps[:n_chosen],
-        policy_logps[n_chosen:],
-    )
+    ).split(n_chosen)
 
-    reference_logps = _get_batch_logps(
+    reference_chosen_logps, reference_rejected_logps = _get_batch_logps(
         tokenizer, reference_logits, concatenated["labels"], average_log_prob=True
-    )
-    reference_chosen_logps, reference_rejected_logps = (
-        reference_logps[:n_chosen],
-        reference_logps[n_chosen:],
-    )
+    ).split(n_chosen)
 
-    # compute the loss
     losses, choosen_reward, rejected_reward = compute_dpo_loss(
         policy_chosen_logps,
         policy_rejected_logps,
         reference_chosen_logps,
         reference_rejected_logps,
     )
-
-    # cleanup gpu memory
-    policy_chosen_logps.detach().cpu()
-    policy_rejected_logps.detach().cpu()
-    reference_chosen_logps.detach().cpu()
-    reference_rejected_logps.detach().cpu()
-    for key in concatenated.keys():
-        concatenated[key] = concatenated[key].cpu()
-
     return losses.mean(), choosen_reward.cpu(), rejected_reward.cpu()
 
 
