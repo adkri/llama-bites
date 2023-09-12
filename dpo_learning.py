@@ -85,39 +85,35 @@ def tokenize_item(tokenizer, prompt, max_length=1024):
 
 
 def forward_and_compute_loss(tokenizer, policy_model, reference_model, batch):
-    chosen = [tokenize_item(tokenizer, item) for item in batch["Chosen"]]
-    rejected = [tokenize_item(tokenizer, item) for item in batch["Rejected"]]
-    # chosen : {input_ids, attention_mask, labels} + rejected {input_ids, attention_mask, labels}
-    combined = chosen + rejected
+    n_chosen = len(batch["Chosen"])
+    combined = [
+        tokenize_item(tokenizer, item) for item in batch["Chosen"] + batch["Rejected"]
+    ]
 
     concatenated = {k: torch.stack([d[k] for d in combined]) for k in combined[0]}
     # concatenated is {input_ids: [....], attention_mask: [...], labels: [....]}
-
     for key in concatenated.keys():
         concatenated[key] = concatenated[key].to("cuda:0")
-        print(concatenated[key])
 
-    # forward pass through policy model
-    policy_logits = policy_model(**concatenated).logits.to(torch.float32)
+    # forward pass through both models
+    policy_logits = policy_model(**concatenated).logits.float()
+    with torch.no_grad():
+        reference_logits = reference_model(**concatenated).logits.float()
+
     policy_logps = _get_batch_logps(
         tokenizer, policy_logits, concatenated["labels"], average_log_prob=True
     )
-
     policy_chosen_logps, policy_rejected_logps = (
-        policy_logps[: len(chosen)],
-        policy_logps[len(chosen) :],
+        policy_logps[:n_chosen],
+        policy_logps[n_chosen:],
     )
 
-    # forward pass through reference model
-    with torch.no_grad():
-        reference_logits = reference_model(**concatenated).logits.to(torch.float32)
     reference_logps = _get_batch_logps(
         tokenizer, reference_logits, concatenated["labels"], average_log_prob=True
     )
-
     reference_chosen_logps, reference_rejected_logps = (
-        reference_logps[: len(chosen)],
-        reference_logps[len(chosen) :],
+        reference_logps[:n_chosen],
+        reference_logps[n_chosen:],
     )
 
     # compute the loss
