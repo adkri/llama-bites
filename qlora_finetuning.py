@@ -1,9 +1,14 @@
 import argparse
+import os
 import time
+import sqlite3
+import sys
+import uuid
 import torch
 import torch.optim as optim
 from collections import namedtuple
 from datasets import load_dataset
+from datetime import datetime
 from peft import get_peft_model, prepare_model_for_kbit_training, LoraConfig, PeftModel
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -32,14 +37,14 @@ Steps for running the finetuning script:
 
 CONFIG = {
     "model_name": "NousResearch/Llama-2-7b-hf",
-    "lora_output_path": "./training_output/",
+    "lora_output_path": "./lora_outputs/",
     "finetuned_model_name": "new-model-name",
     "seed": 111111,
     "gamma": 0.85,
     "epochs": 3,
     "gradient_accumulation_steps": 1,
     "learning_rate": 1e-4,
-    "training_batch_size": 4,
+    "training_batch_size": 3,
     "eval_batch_size": 1,
     "num_workers_dataloader": 1,
     "should_run_validation": True,
@@ -65,9 +70,11 @@ BNB_CONFIG = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=False,
 )
 
-function_calling_ds = load_dataset(
-    "glaiveai/glaive-function-calling-v2", split="train"
-).train_test_split(test_size=0.1)
+function_calling_ds = (
+    load_dataset("glaiveai/glaive-function-calling-v2", split="train")
+    .select(range(10))  # test with just 10 examples
+    .train_test_split(test_size=0.1)  # train - 90%, test - 10%
+)
 
 
 def get_training_dataset(tokenizer):
@@ -143,17 +150,22 @@ def load_from_jsonl(file_path, split="train"):
 def tokenize_item(tokenizer, item, prompt_formatter, max_length=1024):
     prompt = prompt_formatter(item)
     # print(prompt)
-    features = tokenizer(prompt)
+    features = tokenizer(prompt, padding=False, truncation=False, return_tensors="pt")
     # pad the input ids and attention mask, fixes issue with mismatch sizes
-    source_ids = features["input_ids"]
-    padded_input_ids = source_ids + [tokenizer.pad_token_id] * (
-        max_length - len(source_ids)
-    )
-    attention_mask = features["attention_mask"] + [0] * (max_length - len(source_ids))
+    source_ids = features["input_ids"][0]
+    attention_mask = features["attention_mask"][0]
+
+    padded_input_ids = torch.zeros(max_length, dtype=torch.long)
+    padded_attention_mask = torch.zeros(max_length, dtype=torch.long)
+
+    seq_length = min(max_length, len(source_ids))
+    padded_input_ids[:seq_length] = source_ids[:seq_length]
+    padded_attention_mask[:seq_length] = attention_mask[:seq_length]
+
     return {
-        "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
-        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-        "labels": torch.tensor(padded_input_ids, dtype=torch.long),
+        "input_ids": padded_input_ids,
+        "attention_mask": padded_attention_mask,
+        "labels": padded_input_ids.clone(),
     }
 
 
@@ -165,7 +177,7 @@ class TokenizedDataset(Dataset):
         self.dataset = dataset
 
     def __len__(self):
-        return len(self.data)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
         return tokenize_item(
@@ -200,6 +212,114 @@ class TokenizedLocalDataset(Dataset):
             self.tokenizer, next(self.data_gen), self.prompt_formatter, self.max_length
         )
 
+
+# //// METRICS ////
+def create_schema(conn):
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS runs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                start_time DATETIME NOT NULL,
+                config TEXT,
+                end_time DATETIME,
+                avg_epoch_time REAL,
+                avg_ckpt_time REAL,
+                avg_train_perp REAL,
+                avg_train_loss REAL,
+                avg_eval_perp REAL,
+                avg_eval_loss REAL)"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS metrics(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                run_id INTEGER NOT NULL,
+                epoch_num REAL NOT NULL,
+                step INTEGER NOT NULL,
+                loss REAL NOT NULL,
+                learning_rate REAL NOT NULL,
+                perplexity REAL NOT NULL,
+                run_time REAL NOT NULL,
+                batch_size INTEGER NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES runs(run_id))"""
+    )
+    conn.commit()
+
+
+def log_run(conn, run_name, start_time):
+    c = conn.cursor()
+    print(f"Starting logging for run: {run_name}")
+    c.execute(
+        """INSERT INTO runs(name, start_time) VALUES(?, ?)""",
+        (run_name, start_time),
+    )
+    conn.commit()
+    return c.lastrowid
+
+
+def log_metrics(
+    conn,
+    run_id,
+    epoch_num,
+    step,
+    loss,
+    learning_rate,
+    perplexity,
+    run_time,
+    batch_size,
+    run_type="train",
+):
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO metrics(run_id, type, epoch_num, step, loss, learning_rate, perplexity, run_time, batch_size) VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            run_type,
+            epoch_num,
+            step,
+            loss,
+            learning_rate,
+            perplexity,
+            run_time,
+            batch_size,
+        ),
+    )
+    conn.commit()
+    return c.lastrowid
+
+
+def log_final_metrics(
+    conn,
+    run_id,
+    avg_epoch_time,
+    avg_ckpt_time,
+    avg_train_perp,
+    avg_train_loss,
+    avg_eval_perp,
+    avg_eval_loss,
+):
+    c = conn.cursor()
+    c.execute(
+        """UPDATE runs SET end_time = ?, avg_epoch_time = ?, avg_ckpt_time = ?, avg_train_perp = ?, avg_train_loss = ?, avg_eval_perp = ?, avg_eval_loss = ? WHERE id = ?""",
+        (
+            datetime.now(),
+            avg_epoch_time,
+            avg_ckpt_time,
+            avg_train_perp,
+            avg_train_loss,
+            avg_eval_perp,
+            avg_eval_loss,
+            run_id,
+        ),
+    )
+    conn.commit()
+    return c.lastrowid
+
+
+conn = sqlite3.connect("metrics.db")
+create_schema(conn)
 
 # //// MAIN DRIVER ////
 
@@ -256,12 +376,7 @@ def get_dataloader(tokenizer, split, batch_size):
 
 
 def train(
-    model,
-    tokenizer,
-    optimizer,
-    lr_scheduler,
-    train_dataloader,
-    eval_dataloader,
+    model, tokenizer, optimizer, lr_scheduler, train_dataloader, eval_dataloader, run_id
 ):
     epoch_times = []
     gradient_accumulation_steps = CONFIG["gradient_accumulation_steps"]
@@ -300,9 +415,20 @@ def train(
             ) - 1:
                 optimizer.step()
                 optimizer.zero_grad()
-                pbar.update(step // gradient_accumulation_steps)
+                pbar.update(1)
+                log_metrics(
+                    conn,
+                    run_id,
+                    epoch,
+                    step,
+                    loss.detach().float().item(),
+                    optimizer.param_groups[0]["lr"],
+                    torch.exp(loss.detach().float()).item(),
+                    time.perf_counter() - start_time,
+                    CONFIG["training_batch_size"],
+                )
             pbar.set_description(
-                f"Training epoch: {epoch}/{CONFIG['epochs']}, step: {step}/{len(train_dataloader)} completed - loss: {loss.detach().float()}"
+                f"Training epoch: {epoch+1}/{CONFIG['epochs']}, step: {step+1}/{len(train_dataloader)} completed - loss: {loss.detach().float()}"
             )
 
         epoch_end_time = time.perf_counter() - start_time
@@ -310,8 +436,8 @@ def train(
 
         train_epoch_loss = total_loss / len(train_dataloader)
         train_perplexity = torch.exp(train_epoch_loss)
-        train_perp.append(train_perplexity)
-        train_loss.append(train_epoch_loss)
+        train_perp.append(train_perplexity.item())
+        train_loss.append(train_epoch_loss.item())
 
         # update the lr
         lr_scheduler.step()
@@ -328,9 +454,22 @@ def train(
 
             if eval_loss < best_val_loss:
                 best_val_loss = eval_loss
-                print(f"New best validation loss: {best_val_loss} on epoch: {epoch}")
+                print(f"New best validation loss: {best_val_loss} on epoch: {epoch+1}")
             eval_losses.append(best_val_loss)
             eval_perps.append(eval_perp)
+
+            log_metrics(
+                conn,
+                run_id,
+                epoch,
+                0,
+                eval_loss,
+                optimizer.param_groups[0]["lr"],
+                eval_perp,
+                ckpt_end_time,
+                CONFIG["eval_batch_size"],
+                run_type="eval",
+            )
 
         print(
             f"Epoch: {epoch+1}, train_perplexity: {train_perplexity:.4f}, train_epoch_loss: {train_epoch_loss:.4f}, epoch_time: {epoch_end_time}s"
@@ -348,6 +487,17 @@ def train(
     if CONFIG["should_run_validation"]:
         results["avg_eval_perp"] = sum(eval_perps) / len(eval_perps)
         results["avg_eval_loss"] = sum(eval_losses) / len(eval_losses)
+
+    log_final_metrics(
+        conn,
+        run_id,
+        results["avg_epoch_time"],
+        results["avg_ckpt_time"],
+        results["avg_train_perp"],
+        results["avg_train_loss"],
+        results["avg_eval_perp"] if CONFIG["should_run_validation"] else None,
+        results["avg_eval_loss"] if CONFIG["should_run_validation"] else None,
+    )
 
     return results
 
@@ -374,10 +524,19 @@ def evaluate(model, tokenizer, eval_dataloader):
     eval_perp = torch.exp(eval_loss)
 
     print(f"Eval loss: {eval_loss}, Eval perplexity: {eval_perp}")
-    return eval_perp, eval_loss
+    return eval_perp.item(), eval_loss.item()
 
 
-def main_pipeline():
+def main_pipeline(run_name):
+    # prefix the run name with the current time in YYYY-MM-DD-HHMM format
+    start_time = datetime.now()
+    run_name = (
+        run_name.strip() if run_name is not None else str(uuid.uuid4()).split("-")[0]
+    )
+    run_name_prefixed = f"{start_time.strftime('%Y-%m-%d-%H%M')}-{run_name}"
+    run_id = log_run(conn, run_name_prefixed, start_time)
+    CONFIG["lora_output_path"] = f"./lora_outputs/{run_id}"
+
     torch.cuda.manual_seed(CONFIG["seed"])
     torch.manual_seed(CONFIG["seed"])
 
@@ -399,6 +558,7 @@ def main_pipeline():
         lr_scheduler,
         train_dataloader,
         eval_dataloader,
+        run_id,
     )
 
     # print results
@@ -423,6 +583,10 @@ def load_and_merge_lora_to_model():
 
 
 if __name__ == "__main__":
+    # ds = get_training_dataset(init_tokenizer())
+    # print(ds[0])
+    # sys.exit(0)
+    os.makedirs(CONFIG["lora_output_path"], exist_ok=True)
     parser = argparse.ArgumentParser(
         description="Run the finetuning script or merge lora to the final model"
     )
@@ -433,9 +597,15 @@ if __name__ == "__main__":
         required=True,
         help="The mode to run the script in, either 'finetune' or 'merge'",
     )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        required=False,
+        help="The name of the run, used for logging",
+    )
     args = parser.parse_args()
 
     if args.mode == "finetune":
-        main_pipeline()
+        main_pipeline(args.run_name)
     elif args.mode == "merge":
         load_and_merge_lora_to_model()
